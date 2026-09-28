@@ -1,0 +1,37 @@
+[Unit]
+Description=dots home-directory install server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dots
+Group=dots
+Environment=DOTS_DATA=/var/lib/dots
+Environment=DOTS_TOKENS=/etc/dots/tokens
+Environment=DOTS_ADDR=127.0.0.1:8760
+Environment=DOTS_ORIGIN=https://@DOMAIN@
+# Google sign-in for the browser login; written by deploy/google.sh.
+EnvironmentFile=-/etc/dots/google.env
+ExecStart=/usr/local/bin/dots serve
+# Re-reads the tokens file without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+StateDirectory=dots
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
