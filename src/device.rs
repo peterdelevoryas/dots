@@ -22,9 +22,10 @@ use crate::auth::{Level, Tokens};
 
 /// How long a device code (and a Google sign-in started for it) stays valid.
 pub const DEVICE_TTL: Duration = Duration::from_secs(10 * 60);
-/// How long the read token handed to an approved machine works. It only
-/// needs to outlast fetching the bootstrap script and the bundle.
-pub const TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long the token handed to an approved machine works. The scripts keep
+/// it (keychain or a private file), so re-running them within this window
+/// doesn't need another approval.
+pub const TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How often the shim should poll, in seconds.
 pub const POLL_INTERVAL: u64 = 3;
 /// Caps memory use if someone hammers the public endpoint.
@@ -64,6 +65,8 @@ pub struct Request {
     pub name: String,
     /// The address the request came from, for the approval page.
     pub ip: String,
+    /// What the machine is asking for: read to install, write to push.
+    pub level: Level,
     pub created: Instant,
     approved: Option<String>,
 }
@@ -98,7 +101,7 @@ impl Device {
 
     /// Starts a request. Returns (device code, user code), or None if too many
     /// are already pending.
-    pub fn start(&self, name: &str, ip: &str) -> Option<(String, String)> {
+    pub fn start(&self, name: &str, ip: &str, level: Level) -> Option<(String, String)> {
         let mut state = self.state.lock().unwrap();
         state.prune();
         if state.requests.len() >= MAX_PENDING {
@@ -113,6 +116,7 @@ impl Device {
                 user_code: user_code.clone(),
                 name,
                 ip: ip.chars().take(64).collect(),
+                level,
                 created: Instant::now(),
                 approved: None,
             },
@@ -220,14 +224,21 @@ impl Device {
             if request.user_code != user_code || request.approved.is_some() {
                 continue;
             }
-            let token =
-                self.tokens
-                    .issue_temporary(&format!("device:{email}"), Level::Read, TOKEN_TTL);
+            // The source names who approved which machine, so the issued
+            // tokens file shows what each line is for.
+            let name: String = request
+                .name
+                .chars()
+                .map(|c| if c.is_whitespace() { '-' } else { c })
+                .collect();
+            let source = format!("google:{email}:{name}");
+            let token = self.tokens.issue(&source, request.level, TOKEN_TTL)?;
             request.approved = Some(token);
             tracing::info!(
                 email,
                 name = request.name,
                 ip = request.ip,
+                level = %request.level,
                 "approved device"
             );
             return Ok(request.clone());
@@ -375,14 +386,14 @@ pub mod tests {
     fn device() -> Device {
         let dir = crate::store::tests::temp_dir("device");
         std::fs::write(dir.join("tokens"), "").unwrap();
-        let tokens = Tokens::load(&dir.join("tokens")).unwrap();
+        let tokens = Tokens::load(&dir.join("tokens"), &dir.join("issued")).unwrap();
         Device::new(Some(google()), tokens, "https://dots.test".into())
     }
 
     #[test]
     fn flow() {
         let device = device();
-        let (device_code, user_code) = device.start("newbox", "1.2.3.4").unwrap();
+        let (device_code, user_code) = device.start("newbox", "1.2.3.4", Level::Write).unwrap();
         assert!(matches!(device.poll(&device_code), Poll::Pending));
         assert!(matches!(device.poll("wrong"), Poll::Expired));
 
@@ -412,9 +423,9 @@ pub mod tests {
     fn caps_pending_requests() {
         let device = device();
         for _ in 0..MAX_PENDING {
-            assert!(device.start("x", "ip").is_some());
+            assert!(device.start("x", "ip", Level::Read).is_some());
         }
-        assert!(device.start("x", "ip").is_none());
+        assert!(device.start("x", "ip", Level::Read).is_none());
     }
 
     #[test]

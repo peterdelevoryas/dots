@@ -40,6 +40,7 @@ pub fn router(store: Store, tokens: Tokens, device: Device, origin: String) -> R
     };
     let authed = Router::new()
         .route("/bootstrap", get(bootstrap))
+        .route("/whoami", get(whoami))
         .route("/bundle", get(current_bundle).put(put_bundle))
         .route("/bundle/{version}", get(bundle))
         .route("/versions", get(versions))
@@ -80,6 +81,12 @@ async fn install(State(app): State<App>) -> Response {
     script(SHIM.replace("@ORIGIN@", &app.origin))
 }
 
+/// Which token this is, so the scripts can check a saved one still works:
+/// `<source> <level>`.
+async fn whoami(Extension(client): Extension<Client>) -> String {
+    format!("{} {}\n", client.source, client.level)
+}
+
 async fn bootstrap(State(app): State<App>) -> Response {
     script(BOOTSTRAP.replace("@ORIGIN@", &app.origin))
 }
@@ -90,6 +97,9 @@ async fn bootstrap(State(app): State<App>) -> Response {
 struct CodeForm {
     #[serde(default)]
     name: String,
+    /// `read` to install (the default) or `write` to push bundles.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Public: the shim starts a login here. The reply is `key=value` lines so a
@@ -103,12 +113,16 @@ async fn device_code(
         let msg = "browser login isn't set up on this server; set DOTS_TOKEN instead\n";
         return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
     }
+    let level = match form.scope.as_deref().unwrap_or("read").parse::<Level>() {
+        Ok(level) => level,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    };
     let ip = client_ip(&headers);
-    let Some((device_code, user_code)) = app.device.start(&form.name, &ip) else {
+    let Some((device_code, user_code)) = app.device.start(&form.name, &ip, level) else {
         let msg = "too many logins in progress; try again in a few minutes\n";
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     };
-    tracing::info!(name = form.name, ip, user_code, "device login started");
+    tracing::info!(name = form.name, ip, user_code, %level, "device login started");
     let body = format!(
         "device_code={device_code}\nuser_code={user_code}\nurl={}/device?code={user_code}\ninterval={}\nexpires_in={}\n",
         app.origin,
@@ -169,11 +183,18 @@ async fn device_page(State(app): State<App>, Query(query): Query<DeviceQuery>) -
         1 => "1 minute ago".to_string(),
         n => format!("{n} minutes ago"),
     };
+    let (asking, command) = match request.level {
+        Level::Read => ("to install your home directory", "the install command"),
+        Level::Write => (
+            "for <strong>write access</strong>, to push new bundles that every future install will get",
+            "dotpush",
+        ),
+    };
     let body = format!(
-        "<p>A machine is asking to install your home directory.</p>\
+        "<p>A machine is asking {asking}.</p>\
          <p class=\"code\">{code}</p>\
-         <dl><dt>Machine</dt><dd>{name}</dd><dt>Address</dt><dd>{ip}</dd><dt>Requested</dt><dd>{when}</dd></dl>\
-         <p class=\"warn\">Only approve this if you just ran the install command yourself and this code matches your terminal.</p>\
+         <dl><dt>Machine</dt><dd>{name}</dd><dt>Address</dt><dd>{ip}</dd><dt>Requested</dt><dd>{when}</dd><dt>Lasts</dt><dd>30 days on that machine</dd></dl>\
+         <p class=\"warn\">Only approve this if you just ran {command} yourself and this code matches your terminal.</p>\
          <form method=\"post\" action=\"/device/login\">\
          <input type=\"hidden\" name=\"user_code\" value=\"{code}\">\
          <button>Approve with Google</button></form>",
@@ -510,7 +531,7 @@ mod tests {
         )
         .unwrap();
         let store = Store::open(&dir.join("data")).unwrap();
-        let tokens = Tokens::load(&tokens_path).unwrap();
+        let tokens = Tokens::load(&tokens_path, &dir.join("issued")).unwrap();
         let origin = "https://dots.test".to_string();
         let device = Device::new(
             Some(device::tests::google()),
@@ -638,6 +659,15 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(text(resp).await.contains(r#"origin="https://dots.test""#));
 
+        let resp = send(
+            &app,
+            "POST",
+            "/device/code",
+            None,
+            b"name=newbox&scope=bogus".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let resp = send(&app, "POST", "/device/code", None, b"name=newbox".to_vec()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = text(resp).await;
@@ -716,5 +746,49 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let resp = send(&app, "POST", "/device/token", None, poll).await;
         assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn write_login_can_push() {
+        let (app, device) = app_with_device();
+        let resp = send(
+            &app,
+            "POST",
+            "/device/code",
+            None,
+            b"name=laptop&scope=write".to_vec(),
+        )
+        .await;
+        let body = text(resp).await;
+        let field = |k: &str| {
+            body.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .unwrap()
+                .to_string()
+        };
+        let resp = send(
+            &app,
+            "GET",
+            &format!("/device?code={}", field("user_code")),
+            None,
+            vec![],
+        )
+        .await;
+        assert!(text(resp).await.contains("write access"));
+        device.approve_for_test(&field("user_code"));
+        let poll = format!("device_code={}", field("device_code")).into_bytes();
+        let token = text(send(&app, "POST", "/device/token", None, poll).await).await;
+        let token = token.trim();
+        let resp = send(&app, "GET", "/whoami", Some(token), vec![]).await;
+        assert_eq!(text(resp).await, "google:me@example.com:laptop write\n");
+        let resp = send(
+            &app,
+            "PUT",
+            "/bundle",
+            Some(token),
+            tarball(&[("setup.sh", "")]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }

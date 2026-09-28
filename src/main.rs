@@ -63,7 +63,8 @@ async fn serve() -> Result<()> {
     let origin = origin.trim_end_matches('/').to_string();
 
     let store = store::Store::open(&data)?;
-    let tokens = auth::Tokens::load(&tokens_path)?;
+    // Browser-login tokens live with the data, where the service can write.
+    let tokens = auth::Tokens::load(&tokens_path, &data.join("issued-tokens"))?;
     let google = google_config()?;
     match &google {
         Some(g) => tracing::info!(allowed = ?g.allowed_emails, "browser login enabled"),
