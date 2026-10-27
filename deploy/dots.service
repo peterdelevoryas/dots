@@ -8,7 +8,7 @@ User=dots
 Group=dots
 Environment=DOTS_DATA=/var/lib/dots
 Environment=DOTS_TOKENS=/etc/dots/tokens
-Environment=DOTS_ADDR=127.0.0.1:8760
+Environment=DOTS_ADDR=@PRIVATE_IP@:8760
 Environment=DOTS_ORIGIN=https://@DOMAIN@
 # Google sign-in for the browser login; written by deploy/google.sh.
 EnvironmentFile=-/etc/dots/google.env
